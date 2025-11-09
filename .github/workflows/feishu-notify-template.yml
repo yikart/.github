@@ -1,26 +1,29 @@
-name: Feishu Notify Template (No Relay, Noise Control, Stable)
+name: Feishu Notify Template (Python, No Relay, Noise Control)
 
 on:
   workflow_call:
     inputs:
       important_labels:
+        type: string
         default: "urgent,security,release-blocker"
-        type: string
       important_paths_regex:
+        type: string
         default: "^(apps/web/|infra/|payment/|security/)"
-        type: string
       pr_min_changed_files:
+        type: string
         default: "0"
-        type: string
       title_keywords_regex:
+        type: string
         default: "(hotfix|rollback|security|incident)"
-        type: string
       notify_issue_on_open_close_without_labels:
-        default: "false"
         type: string
+        default: "false"
     secrets:
       FEISHU_WEBHOOK:
         required: true
+
+permissions:
+  contents: read
 
 jobs:
   pr_issue_notify:
@@ -32,118 +35,159 @@ jobs:
       KW_REGEX: ${{ inputs.title_keywords_regex }}
       ISSUE_NOTIFY_LOOSE: ${{ inputs.notify_issue_on_open_close_without_labels }}
     steps:
-      - name: Decide & Send (PR / Issue)
-        shell: bash
+      - name: Decide & Send (PR / Issue) — Python
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         run: |
-          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.request, urllib.error
 
-          echo "::group::Event payload"
-          echo '${{ toJson(github.event) }}' | jq -C . | sed -e 's/^/  /'
-          echo "::endgroup::"
+          def log_group(title, text):
+              print(f"::group::{title}")
+              print(text)
+              print("::endgroup::")
 
-          EVENT_NAME="${{ github.event_name }}"
-          ACTION="${{ github.event.action }}"
-          REPO="${{ github.repository }}"
-          SENDER="${{ github.actor }}"
-          API="${{ github.api_url }}"
+          # ---- load inputs/env ----
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          with open(os.environ["GITHUB_EVENT_PATH"], "r", encoding="utf-8") as f:
+              event = json.load(f)
+          repo = os.environ["GITHUB_REPOSITORY"]
+          api = os.environ["GITHUB_API_URL"]
+          gh_token = os.environ["GH_TOKEN"]
+          feishu = os.environ["FEISHU_WEBHOOK"]
 
-          should_send=0
-          header_color="blue"
-          card_title="GitHub Notification"
-          body_md=""
-          url=""
+          imp_labels = [x.strip() for x in os.environ.get("IMP_LABELS","").split(",") if x.strip()]
+          imp_paths = os.environ.get("IMP_PATHS","")
+          kw_regex = os.environ.get("KW_REGEX","")
+          pr_min_files = int(os.environ.get("PR_MIN_FILES","0") or "0")
+          issue_loose = os.environ.get("ISSUE_NOTIFY_LOOSE","false").lower() == "true"
 
-          contains_label () {
-            local wanted_csv="$1"
-            local labels_csv="$2"
-            IFS=',' read -r -a arr <<< "$wanted_csv"
-            for l in "${arr[@]}"; do
-              if echo "$labels_csv" | grep -Eiq "(^|,)\ *${l}\ *(,|$)"; then return 0; fi
-            done
-            return 1
-          }
+          log_group("Event payload", json.dumps(event, indent=2))
 
-          to_csv_labels () {
-            jq -r '(.pull_request.labels // .issue.labels // []) | map(.name) | join(",")' <<< '${{ toJson(github.event) }}'
-          }
+          def labels_csv(labels):
+              return ",".join([l.get("name","") for l in (labels or [])])
 
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            PR_NUM="${{ github.event.pull_request.number }}"
-            PR_TITLE="${{ github.event.pull_request.title }}"
-            PR_BODY="$(jq -r '.pull_request.body // ""' <<< '${{ toJson(github.event) }}')"
-            PR_URL="${{ github.event.pull_request.html_url }}"
-            PR_FROM="${{ github.event.pull_request.head.ref }}"
-            PR_TO="${{ github.event.pull_request.base.ref }}"
-            PR_CHANGED="${{ github.event.pull_request.changed_files }}"
-            PR_MERGED="${{ github.event.pull_request.merged }}"
-            LABELS="$(to_csv_labels)"
+          def has_imp_label(labels):
+              s = ",".join([l.get("name","") for l in (labels or [])]).lower()
+              return any((","+x.lower()+",") in (","+s+",") for x in imp_labels)
 
-            # 关键节点
-            case "$ACTION" in
-              opened|ready_for_review) should_send=1 ;;
-              closed) [[ "$PR_MERGED" == "true" ]] && should_send=1 ;;
-            esac
+          def match_kw(text):
+              return bool(re.search(kw_regex, text or "", flags=re.I)) if kw_regex else False
 
-            # 其他触发条件（命中其一即可）
-            contains_label "$IMP_LABELS" "$LABELS" && should_send=1
-            echo "$PR_TITLE $PR_BODY" | grep -Eiq "$KW_REGEX" && should_send=1
-            if [[ "$PR_MIN_FILES" =~ ^[0-9]+$ ]] && (( PR_CHANGED >= PR_MIN_FILES )); then
-              should_send=1
-            fi
+          def fetch_pr_files(pr_number):
+              url = f"{api}/repos/{repo}/pulls/{pr_number}/files?per_page=200"
+              req = urllib.request.Request(url, headers={
+                  "Accept":"application/vnd.github+json",
+                  "Authorization": f"Bearer {gh_token}"
+              })
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read().decode("utf-8"))
+          
+          def send_card(title, color, md, url):
+              card = {
+                "msg_type": "interactive",
+                "card": {
+                  "header": {"template": color, "title":{"tag":"plain_text","content": title}},
+                  "elements":[
+                    {"tag":"div","text":{"tag":"lark_md","content": md}},
+                    {"tag":"action","actions":[
+                      {"tag":"button","text":{"tag":"plain_text","content":"🔗 Open in GitHub"},
+                       "type":"primary","url": url}
+                    ]}
+                  ]
+                }
+              }
+              body = json.dumps(card).encode("utf-8")
+              req = urllib.request.Request(feishu, data=body, headers={"Content-Type":"application/json"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      resp = r.read().decode("utf-8")
+                      log_group("Feishu response", f"HTTP {r.status}\n{resp}")
+                      if r.status != 200:
+                          sys.exit(1)
+              except urllib.error.HTTPError as e:
+                  text = e.read().decode("utf-8", "ignore")
+                  log_group("Feishu response (error)", f"HTTP {e.code}\n{text}")
+                  sys.exit(1)
 
-            # 路径过滤（命中关键目录也触发）
-            echo "Fetching changed files for path filter…"
-            curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GH_TOKEN" \
-              "$API/repos/$REPO/pulls/$PR_NUM/files?per_page=200" > files.json
-            if jq -r '.[].filename' files.json | grep -Eq "$IMP_PATHS"; then
-              should_send=1
-            fi
+          should_send = False
+          header_color = "blue"
+          card_title = "GitHub Notification"
+          body_md = ""
+          url = ""
 
-            card_title="PR · $REPO #$PR_NUM · $ACTION"
-            header_color="blue"
-            [[ "$ACTION" == "closed" && "$PR_MERGED" == "true" ]] && header_color="green"
-            url="$PR_URL"
-            body_md="**Title:** $PR_TITLE\n**By:** $SENDER\n**From:** $PR_FROM → **To:** $PR_TO\n**Changed files:** $PR_CHANGED"
+          if event_name == "pull_request":
+              pr = event["pull_request"]
+              action = event.get("action")
+              pr_num = pr["number"]
+              pr_title = pr.get("title","")
+              pr_body = pr.get("body","") or ""
+              pr_url = pr.get("html_url","")
+              pr_from = pr.get("head",{}).get("ref","")
+              pr_to = pr.get("base",{}).get("ref","")
+              pr_changed = int(pr.get("changed_files") or 0)
+              pr_merged = bool(pr.get("merged"))
+              pr_labels = pr.get("labels",[])
 
-          elif [[ "$EVENT_NAME" == "issues" ]]; then
-            ISSUE_NUM="${{ github.event.issue.number }}"
-            ISSUE_TITLE="${{ github.event.issue.title }}"
-            ISSUE_BODY="$(jq -r '.issue.body // ""' <<< '${{ toJson(github.event) }}')"
-            ISSUE_URL="${{ github.event.issue.html_url }}"
-            LABELS="$(to_csv_labels)"
+              # 基线：关键节点
+              if action in ("opened","ready_for_review"): should_send = True
+              if action == "closed" and pr_merged: should_send = True
 
-            if [[ "$ACTION" == "reopened" ]]; then
-              should_send=1
-            elif [[ "$ACTION" == "opened" || "$ACTION" == "closed" ]]; then
-              if contains_label "$IMP_LABELS" "$LABELS" || echo "$ISSUE_TITLE $ISSUE_BODY" | grep -Eiq "$KW_REGEX"; then
-                should_send=1
-              elif [[ "$ISSUE_NOTIFY_LOOSE" == "true" ]]; then
-                should_send=1
-              fi
-            fi
+              # 附加条件：标签/关键词/变更规模/路径
+              if has_imp_label(pr_labels): should_send = True
+              if match_kw(pr_title + " " + pr_body): should_send = True
+              if pr_min_files and pr_changed >= pr_min_files: should_send = True
 
-            card_title="Issue · $REPO #$ISSUE_NUM · $ACTION"
-            header_color="wathet"; [[ "$ACTION" == "closed" ]] && header_color="purple"
-            url="$ISSUE_URL"
-            SUMMARY="$(printf "%s" "$ISSUE_BODY" | tr '\n' ' ' | cut -c1-200)"
-            body_md="**Title:** $ISSUE_TITLE\n**By:** $SENDER\n**Labels:** ${LABELS:-—}\n**Summary:** ${SUMMARY:-—}"
+              # 路径命中
+              try:
+                  files = fetch_pr_files(pr_num)
+                  filenames = [f.get("filename","") for f in files]
+                  if imp_paths and any(re.search(imp_paths, fn) for fn in filenames):
+                      should_send = True
+              except Exception as e:
+                  log_group("Warn", f"Fetch files failed: {e}")
 
-          else
-            echo "Event $EVENT_NAME not handled."
-            exit 0
-          fi
+              card_title = f"PR · {repo} #{pr_num} · {action}"
+              header_color = "green" if (action=="closed" and pr_merged) else "blue"
+              body_md = f"**Title:** {pr_title}\\n**By:** {event.get('actor',{}).get('login', pr.get('user',{}).get('login',''))}\\n**From:** {pr_from} → **To:** {pr_to}\\n**Changed files:** {pr_changed}"
+              url = pr_url
 
-          if [[ "$should_send" -ne 1 ]]; then
-            echo "Noise filtered. Skip sending."
-            exit 0
-          fi
+          elif event_name == "issues":
+              issue = event["issue"]
+              action = event.get("action")
+              issue_num = issue["number"]
+              issue_title = issue.get("title","")
+              issue_body = issue.get("body","") or ""
+              issue_url = issue.get("html_url","")
+              issue_labels = issue.get("labels",[])
 
-          cat > card.json <<'JSON'
-          {
-            "msg_type": "interactive",
-            "card": {
-              "header": { "template": "__COLOR__", "title": { "tag": "plain_text", "content": "__TITLE__" } },
-              "elements": [
-                { "tag": "div", "text": { "tag": "lark_md", "content": "_
+              if action == "reopened":
+                  should_send = True
+              elif action in ("opened","closed"):
+                  if has_imp_label(issue_labels) or match_kw(issue_title + " " + issue_body) or issue_loose:
+                      should_send = True
+
+              card_title = f"Issue · {repo} #{issue_num} · {action}"
+              header_color = "purple" if action=="closed" else "wathet"
+              summary = re.sub(r"\s+"," ",issue_body)[:200] if issue_body else "—"
+              body_md = f"**Title:** {issue_title}\\n**By:** {event.get('actor',{}).get('login', issue.get('user',{}).get('login',''))}\\n**Labels:** {labels_csv(issue_labels) or '—'}\\n**Summary:** {summary}"
+              url = issue_url
+
+          else:
+              print(f"Event {event_name} not handled.")
+              sys.exit(0)
+
+          if not should_send:
+              print("Noise filtered. Skip sending.")
+              sys.exit(0)
+
+          log_group("Feishu request body", json.dumps({
+              "title": card_title, "color": header_color, "md": body_md, "url": url
+          }, indent=2))
+          send_card(card_title, header_color, body_md, url)
+          PY
