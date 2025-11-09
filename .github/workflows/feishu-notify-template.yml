@@ -1,4 +1,4 @@
-name: Feishu Notify Template (Python, No Relay, Noise Control)
+name: Feishu Notify Template (Python, Stable, No Relay)
 
 on:
   workflow_call:
@@ -28,13 +28,25 @@ permissions:
 jobs:
   pr_issue_notify:
     runs-on: ubuntu-latest
-    env:
-      IMP_LABELS: ${{ inputs.important_labels }}
-      IMP_PATHS: ${{ inputs.important_paths_regex }}
-      PR_MIN_FILES: ${{ inputs.pr_min_changed_files }}
-      KW_REGEX: ${{ inputs.title_keywords_regex }}
-      ISSUE_NOTIFY_LOOSE: ${{ inputs.notify_issue_on_open_close_without_labels }}
+
     steps:
+      # ① 这里用 GITHUB_ENV 安全写入“可能含括号/正则”的值，避免 bash 解析
+      - name: Prepare env safely
+        shell: bash
+        run: |
+          {
+            echo "IMP_LABELS=${{ inputs.important_labels }}"
+            echo "PR_MIN_FILES=${{ inputs.pr_min_changed_files }}"
+            echo "ISSUE_NOTIFY_LOOSE=${{ inputs.notify_issue_on_open_close_without_labels }}"
+            echo "IMP_PATHS<<EOF"
+            echo "${{ inputs.important_paths_regex }}"
+            echo "EOF"
+            echo "KW_REGEX<<EOF"
+            echo "${{ inputs.title_keywords_regex }}"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      # ② 主逻辑：Python 读取 env，降噪+发飞书卡片
       - name: Decide & Send (PR / Issue) — Python
         env:
           GH_TOKEN: ${{ github.token }}
@@ -52,7 +64,6 @@ jobs:
               print(text)
               print("::endgroup::")
 
-          # ---- load inputs/env ----
           event_name = os.environ["GITHUB_EVENT_NAME"]
           with open(os.environ["GITHUB_EVENT_PATH"], "r", encoding="utf-8") as f:
               event = json.load(f)
@@ -61,11 +72,11 @@ jobs:
           gh_token = os.environ["GH_TOKEN"]
           feishu = os.environ["FEISHU_WEBHOOK"]
 
-          imp_labels = [x.strip() for x in os.environ.get("IMP_LABELS","").split(",") if x.strip()]
-          imp_paths = os.environ.get("IMP_PATHS","")
-          kw_regex = os.environ.get("KW_REGEX","")
-          pr_min_files = int(os.environ.get("PR_MIN_FILES","0") or "0")
-          issue_loose = os.environ.get("ISSUE_NOTIFY_LOOSE","false").lower() == "true"
+          imp_labels = [x.strip() for x in os.getenv("IMP_LABELS","").split(",") if x.strip()]
+          imp_paths = os.getenv("IMP_PATHS","")
+          kw_regex  = os.getenv("KW_REGEX","")
+          pr_min_files = int(os.getenv("PR_MIN_FILES","0") or "0")
+          issue_loose = os.getenv("ISSUE_NOTIFY_LOOSE","false").lower() == "true"
 
           log_group("Event payload", json.dumps(event, indent=2))
 
@@ -79,15 +90,17 @@ jobs:
           def match_kw(text):
               return bool(re.search(kw_regex, text or "", flags=re.I)) if kw_regex else False
 
-          def fetch_pr_files(pr_number):
-              url = f"{api}/repos/{repo}/pulls/{pr_number}/files?per_page=200"
+          def gh_get(url):
               req = urllib.request.Request(url, headers={
                   "Accept":"application/vnd.github+json",
                   "Authorization": f"Bearer {gh_token}"
               })
               with urllib.request.urlopen(req) as r:
                   return json.loads(r.read().decode("utf-8"))
-          
+
+          def fetch_pr_files(pr_number):
+              return gh_get(f"{api}/repos/{repo}/pulls/{pr_number}/files?per_page=200")
+
           def send_card(title, color, md, url):
               card = {
                 "msg_type": "interactive",
@@ -108,8 +121,7 @@ jobs:
                   with urllib.request.urlopen(req) as r:
                       resp = r.read().decode("utf-8")
                       log_group("Feishu response", f"HTTP {r.status}\n{resp}")
-                      if r.status != 200:
-                          sys.exit(1)
+                      if r.status != 200: sys.exit(1)
               except urllib.error.HTTPError as e:
                   text = e.read().decode("utf-8", "ignore")
                   log_group("Feishu response (error)", f"HTTP {e.code}\n{text}")
@@ -134,16 +146,12 @@ jobs:
               pr_merged = bool(pr.get("merged"))
               pr_labels = pr.get("labels",[])
 
-              # 基线：关键节点
               if action in ("opened","ready_for_review"): should_send = True
               if action == "closed" and pr_merged: should_send = True
-
-              # 附加条件：标签/关键词/变更规模/路径
               if has_imp_label(pr_labels): should_send = True
               if match_kw(pr_title + " " + pr_body): should_send = True
               if pr_min_files and pr_changed >= pr_min_files: should_send = True
 
-              # 路径命中
               try:
                   files = fetch_pr_files(pr_num)
                   filenames = [f.get("filename","") for f in files]
@@ -154,7 +162,8 @@ jobs:
 
               card_title = f"PR · {repo} #{pr_num} · {action}"
               header_color = "green" if (action=="closed" and pr_merged) else "blue"
-              body_md = f"**Title:** {pr_title}\\n**By:** {event.get('actor',{}).get('login', pr.get('user',{}).get('login',''))}\\n**From:** {pr_from} → **To:** {pr_to}\\n**Changed files:** {pr_changed}"
+              actor = (event.get("sender") or event.get("actor") or {}).get("login", pr.get("user",{}).get("login",""))
+              body_md = f"**Title:** {pr_title}\\n**By:** {actor}\\n**From:** {pr_from} → **To:** {pr_to}\\n**Changed files:** {pr_changed}"
               url = pr_url
 
           elif event_name == "issues":
@@ -175,7 +184,8 @@ jobs:
               card_title = f"Issue · {repo} #{issue_num} · {action}"
               header_color = "purple" if action=="closed" else "wathet"
               summary = re.sub(r"\s+"," ",issue_body)[:200] if issue_body else "—"
-              body_md = f"**Title:** {issue_title}\\n**By:** {event.get('actor',{}).get('login', issue.get('user',{}).get('login',''))}\\n**Labels:** {labels_csv(issue_labels) or '—'}\\n**Summary:** {summary}"
+              actor = (event.get("sender") or event.get("actor") or {}).get("login", issue.get("user",{}).get("login",""))
+              body_md = f"**Title:** {issue_title}\\n**By:** {actor}\\n**Labels:** {labels_csv(issue_labels) or '—'}\\n**Summary:** {summary}"
               url = issue_url
 
           else:
