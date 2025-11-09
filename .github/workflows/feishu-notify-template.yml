@@ -163,7 +163,7 @@ jobs:
               card_title = f"PR · {repo} #{pr_num} · {action}"
               header_color = "green" if (action=="closed" and pr_merged) else "blue"
               actor = (event.get("sender") or event.get("actor") or {}).get("login", pr.get("user",{}).get("login",""))
-              body_md = f"**Title:** {pr_title}\\n**By:** {actor}\\n**From:** {pr_from} → **To:** {pr_to}\\n**Changed files:** {pr_changed}"
+              body_md = f"**Title:** {pr_title}\n**By:** {actor}\n**From:** {pr_from} → **To:** {pr_to}\n**Changed files:** {pr_changed}"
               url = pr_url
 
           elif event_name == "issues":
