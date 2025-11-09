@@ -1,0 +1,176 @@
+name: Feishu Notify Template (No Relay, Noise Control)
+
+on:
+  workflow_call:
+    inputs:
+      important_labels:
+        description: "逗号分隔：命中这些标签才更倾向通知（issue 必须命中；PR 命中即可放宽其他条件）"
+        required: false
+        default: "urgent,security,release-blocker"
+        type: string
+      important_paths_regex:
+        description: "关键目录正则（命中其一即可通知），例如 ^(apps/web/|infra/|payment/|security/)"
+        required: false
+        default: "^(apps/web/|infra/|payment/|security/)"
+        type: string
+      pr_min_changed_files:
+        description: "PR 变更文件数阈值（>= 则通知）。0 表示不按大小过滤"
+        required: false
+        default: "0"
+        type: string
+      title_keywords_regex:
+        description: "标题/描述关键字正则（命中则通知）"
+        required: false
+        default: "(hotfix|rollback|security|incident)"
+        type: string
+      notify_issue_on_open_close_without_labels:
+        description: "Issue 在 opened/closed 时未命中关键标签也通知？true/false"
+        required: false
+        default: "false"
+        type: string
+    secrets:
+      FEISHU_WEBHOOK:
+        required: true
+
+jobs:
+  pr_issue_notify:
+    runs-on: ubuntu-latest
+    env:
+      IMP_LABELS: ${{ inputs.important_labels }}
+      IMP_PATHS: ${{ inputs.important_paths_regex }}
+      PR_MIN_FILES: ${{ inputs.pr_min_changed_files }}
+      KW_REGEX: ${{ inputs.title_keywords_regex }}
+      ISSUE_NOTIFY_LOOSE: ${{ inputs.notify_issue_on_open_close_without_labels }}
+    steps:
+      - name: Decide & Send (PR / Issue)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          EVENT_NAME="${{ github.event_name }}"
+          ACTION="${{ github.event.action }}"
+          REPO="${{ github.repository }}"
+          SENDER="${{ github.actor }}"
+          ORG="${{ github.repository_owner }}"
+          API="${{ github.api_url }}"
+
+          should_send=0
+          header_color="blue"
+          card_title="GitHub Notification"
+          body_md=""
+          url=""
+
+          # ---------- helpers ----------
+          contains_label () {
+            labels_csv="$1"
+            IFS=',' read -r -a arr <<< "$labels_csv"
+            for l in "${arr[@]}"; do
+              if echo "$2" | grep -Eiq "(^|,)\ *${l}\ *(,|$)"; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          to_csv_labels () {
+            jq -r '(.pull_request.labels // .issue.labels // []) | map(.name) | join(",")' <<< '${{ toJson(github.event) }}'
+          }
+
+          # ---------- pull_request ----------
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # key fields
+            PR_NUM="${{ github.event.pull_request.number }}"
+            PR_TITLE="${{ github.event.pull_request.title }}"
+            PR_BODY="$(jq -r '.pull_request.body // ""' <<< '${{ toJson(github.event) }}')"
+            PR_URL="${{ github.event.pull_request.html_url }}"
+            PR_FROM="${{ github.event.pull_request.head.ref }}"
+            PR_TO="${{ github.event.pull_request.base.ref }}"
+            PR_CHANGED="${{ github.event.pull_request.changed_files }}"
+            PR_MERGED="${{ github.event.pull_request.merged }}"
+            LABELS="$(to_csv_labels)"
+
+            # ---- baseline: 关键节点才考虑 ----
+            if [ "$ACTION" = "opened" ] || [ "$ACTION" = "ready_for_review" ] || { [ "$ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; }; then
+              should_send=1
+            fi
+
+            # ---- 命中关键标签/关键字/变更规模/路径 均可触发 ----
+            if contains_label "$IMP_LABELS" "$LABELS"; then should_send=1; fi
+            if echo "$PR_TITLE $PR_BODY" | grep -Eiq "$KW_REGEX"; then should_send=1; fi
+            if [ "$PR_MIN_FILES" -gt 0 ] && [ "$PR_CHANGED" -ge "$PR_MIN_FILES" ]; then should_send=1; fi
+
+            # 路径过滤：仅当变更命中关键目录才放宽（用 API 拿文件列表）
+            curl -s -H "Accept: application/vnd.github+json" \
+                 -H "Authorization: Bearer $GH_TOKEN" \
+                 "$API/repos/$REPO/pulls/$PR_NUM/files?per_page=200" > files.json
+            if jq -r '.[].filename' files.json | grep -Eq "$IMP_PATHS"; then
+              should_send=1
+            fi
+
+            # ---- 配色与标题 ----
+            card_title="PR · $REPO #$PR_NUM · $ACTION"
+            header_color="blue"
+            if [ "$ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then header_color="green"; fi
+
+            # ---- 文案 ----
+            url="$PR_URL"
+            body_md="**Title:** $PR_TITLE\n**By:** $SENDER\n**From:** $PR_FROM → **To:** $PR_TO\n**Changed files:** $PR_CHANGED"
+
+          # ---------- issues ----------
+          elif [ "$EVENT_NAME" = "issues" ]; then
+            ISSUE_NUM="${{ github.event.issue.number }}"
+            ISSUE_TITLE="${{ github.event.issue.title }}"
+            ISSUE_BODY="$(jq -r '.issue.body // ""' <<< '${{ toJson(github.event) }}')"
+            ISSUE_URL="${{ github.event.issue.html_url }}"
+            LABELS="$(to_csv_labels)"
+
+            # 基线：只在 opened/closed/reopened 下考虑
+            if [ "$ACTION" = "reopened" ]; then
+              should_send=1
+            elif [ "$ACTION" = "opened" ] || [ "$ACTION" = "closed" ]; then
+              # 默认：必须命中标签或关键词才发；可通过输入参数放宽
+              if contains_label "$IMP_LABELS" "$LABELS" || echo "$ISSUE_TITLE $ISSUE_BODY" | grep -Eiq "$KW_REGEX"; then
+                should_send=1
+              elif [ "$ISSUE_NOTIFY_LOOSE" = "true" ]; then
+                should_send=1
+              fi
+            fi
+
+            card_title="Issue · $REPO #$ISSUE_NUM · $ACTION"
+            header_color="wathet"
+            [ "$ACTION" = "closed" ] && header_color="purple"
+            url="$ISSUE_URL"
+            # 取前 200 字做摘要
+            SUMMARY="$(printf "%s" "$ISSUE_BODY" | tr '\n' ' ' | cut -c1-200)"
+            body_md="**Title:** $ISSUE_TITLE\n**By:** $SENDER\n**Labels:** ${LABELS:-—}\n**Summary:** ${SUMMARY:-—}"
+
+          else
+            echo "Event $EVENT_NAME not handled."
+            exit 0
+          fi
+
+          if [ "$should_send" -ne 1 ]; then
+            echo "Noise filtered. Skip sending."
+            exit 0
+          fi
+
+          # ---------- 发送飞书交互卡片 ----------
+          cat > card.json <<EOF
+          {
+            "msg_type": "interactive",
+            "card": {
+              "header": { "template": "${header_color}", "title": { "tag": "plain_text", "content": "${card_title}" } },
+              "elements": [
+                { "tag": "div", "text": { "tag": "lark_md", "content": "${body_md//\"/\\\"}" } },
+                { "tag": "action", "actions": [
+                  { "tag": "button", "text": { "tag": "plain_text", "content": "🔗 Open in GitHub" }, "type": "primary", "url": "${url}" }
+                ]}
+              ]
+            }
+          }
+          EOF
+
+          curl -s -X POST '${{ secrets.FEISHU_WEBHOOK }}' \
+               -H 'Content-Type: application/json' \
+               -d @card.json | cat
